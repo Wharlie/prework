@@ -5,24 +5,24 @@ from pathlib import Path
 from random import randrange
 from typing import Type, TypeVar
 
-from pydantic import BaseModel, Field, IPvAnyAddress, SecretStr
+from pydantic import BaseModel, Field, SecretStr
 
 
 class ClusterIntention(Enum):
     """集群风格枚举"""
 
-    SOCIAL: str = "social"
-    COOPERATIVE: str = "cooperative"
-    COMPETITIVE: str = "competitive"
-    MADNESS: str = "madness"
+    SOCIAL = "social"
+    COOPERATIVE = "cooperative"
+    COMPETITIVE = "competitive"
+    MADNESS = "madness"
 
 
 class GameMode(Enum):
     """游戏模式枚举"""
 
-    SURVIVAL: str = "survival"
-    ENDLESS: str = "endless"
-    WILDERNESS: str = "wilderness"
+    SURVIVAL = "survival"
+    ENDLESS = "endless"
+    WILDERNESS = "wilderness"
 
 
 class ClusterMiscModel(BaseModel):
@@ -36,9 +36,9 @@ class ClusterShardModel(BaseModel):
     """集群分片配置模型"""
 
     shard_enabled: bool = False
-    bind_ip: IPvAnyAddress = IPv4Address("127.0.0.1")
+    bind_ip: IPv4Address = IPv4Address("127.0.0.1")
     master_port: int = 10888
-    master_ip: IPvAnyAddress
+    master_ip: IPv4Address
     cluster_key: str
 
 
