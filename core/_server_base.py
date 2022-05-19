@@ -4,9 +4,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from json import loads
 from logging import Logger, getLogger
+from os import close, dup2, fdopen, pipe
 from pathlib import Path
 from re import sub
-from typing import ClassVar, Optional
+from threading import Timer
+from typing import IO, Any, Callable, ClassVar, Optional
 
 from pydantic import BaseModel
 
@@ -20,10 +22,6 @@ class Arch(Enum):
     x86_64 = 64
     x64 = 64
 
-class Timer:
-    """TODO:定时器"""
-    # from threading import Timer
-    pass
 
 @dataclass
 class ServerBase(ABC):
@@ -65,6 +63,44 @@ class ServerBase(ABC):
         ...
 
     @staticmethod
+    def _timeout_call(
+        func: Callable,
+        timeout: float,
+        error_message: str = "Timeout",
+        args: Optional[tuple] = None,
+        kwargs: Optional[dict] = None,
+    ) -> Any:
+        """调用对应函数，超时则抛出异常"""
+        args = args or ()
+        kwargs = kwargs or {}
+
+        def handle_timeout():
+            raise TimeoutError(error_message)
+
+        timer = Timer(interval=timeout, function=handle_timeout)
+        timer.start()
+        result = func(*args, **kwargs)
+        timer.cancel()
+        return result
+
+    @staticmethod
+    def _open_inheritable_pipe(target_fd: int, mode: str) -> IO:
+        """打开可继承的管道"""
+        rfd, wfd = pipe()
+        match mode:
+            case w_mode if "w" in w_mode:
+                return_fd = rfd
+                relay_fd = wfd
+            case r_mode if "r" in r_mode:
+                return_fd = wfd
+                relay_fd = rfd
+            case _:
+                raise ValueError(f"未知的模式 {mode}")
+        dup2(relay_fd, target_fd, inheritable=True)
+        close(relay_fd)
+        return fdopen(fd=return_fd, mode=mode)
+
+    @staticmethod
     def _convert_table_to_dict(table_str: str) -> dict:
         """将表示 lua 中 table 的字符串转为 Python 中的 dict"""
         s = table_str.replace("=", ":").replace('["', '"').replace('"]', '"')
@@ -72,6 +108,14 @@ class ServerBase(ABC):
         s = sub(r",(?=\s*?[}|\]])", r"", s)  # 去列表尾逗号
         json_obj = loads(s if s else "{}")
         return dict(json_obj)
+
+    @classmethod
+    def _extract_data(cls, path: str) -> dict:
+        """提取存档文件中易识别的 lua 数据"""
+        with open(path, "r") as f:
+            raw_str = f.read()
+        table_str = raw_str[raw_str.find("{") : raw_str.find("\x00")]
+        return cls._convert_table_to_dict(table_str)
 
     @staticmethod
     def _load_ini(ini_path: Path) -> dict:
@@ -84,7 +128,7 @@ class ServerBase(ABC):
 
         # ini_parser 支持常见的 dict 操作
         # 具体地说是实现了 collections.abc.MutableMapping 可变映射接口
-        # 但它会强制加载一个 "DEFAULT" section
+        # 但它会额外加载一个 "DEFAULT" section
         # 这里转化成标准的 dict
         d = dict()
         for section_name in ini_parser.sections():
@@ -115,3 +159,5 @@ class ServerBase(ABC):
         self.logger.info(f"保存配置文件 {ini_path}")
         config_dict = self.config.dict()
         self._save_ini(config_dict, ini_path)
+
+if __name__ =="__main__":

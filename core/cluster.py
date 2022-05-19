@@ -3,6 +3,7 @@ from enum import Enum
 from ipaddress import IPv4Address
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Thread
 from typing import ClassVar, Iterable
 
 from pydantic import BaseModel
@@ -169,7 +170,7 @@ class Cluster(ServerBase):
         """更新 mod"""
         with TemporaryDirectory() as temp_dir:
             temp_dir_path = Path(temp_dir)
-            # TODO: 集群分片文件夹都可以是 Temp 吗？
+            
 
     @classmethod
     def update_steam(cls) -> None:
@@ -198,6 +199,15 @@ class Cluster(ServerBase):
 
         self.mods_path.mkdir(exist_ok=True)
         self.ugc_path.mkdir(exist_ok=True)
+    
+    def _monitor_stats(self) -> None:
+        """监控 shard 的 fd5 中的统计信息"""
+
+        
+        for shard in self.shard_list:
+            pass
+            
+        
 
     def update(self) -> None:
         """更新"""
