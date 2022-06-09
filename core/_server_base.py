@@ -1,26 +1,15 @@
 from abc import ABC, abstractmethod
 from configparser import ConfigParser as IniConfigParser
 from dataclasses import dataclass, field
-from enum import Enum
 from json import loads
 from logging import Logger, getLogger
 from os import close, dup2, fdopen, pipe
 from pathlib import Path
 from re import sub
 from threading import Timer
-from typing import IO, Any, Callable, ClassVar, Optional
+from typing import IO, Any, Callable, ClassVar, Optional, Type, cast
 
 from pydantic import BaseModel
-
-
-class Arch(Enum):
-    """架构枚举"""
-
-    x86 = 32
-    i386 = 32
-    amd64 = 64
-    x86_64 = 64
-    x64 = 64
 
 
 @dataclass
@@ -30,7 +19,7 @@ class ServerBase(ABC):
     config_file_name: ClassVar[str]
 
     dir_path: Path
-    config: BaseModel
+    config: BaseModel = field(default_factory=BaseModel, init=False)
     _logger: Optional[Logger] = field(default=None, init=False)
 
     @property
@@ -48,6 +37,11 @@ class ServerBase(ABC):
         return self._logger
 
     @abstractmethod
+    def is_running(self) -> bool:
+        """是否在运行中"""
+        ...
+
+    @abstractmethod
     def start(self) -> None:
         """启动"""
         ...
@@ -55,11 +49,6 @@ class ServerBase(ABC):
     @abstractmethod
     def stop(self) -> None:
         """停止"""
-        ...
-
-    @abstractmethod
-    def restart(self) -> None:
-        """重启"""
         ...
 
     @staticmethod
@@ -89,11 +78,11 @@ class ServerBase(ABC):
         rfd, wfd = pipe()
         match mode:
             case w_mode if "w" in w_mode:
-                return_fd = rfd
-                relay_fd = wfd
-            case r_mode if "r" in r_mode:
                 return_fd = wfd
                 relay_fd = rfd
+            case r_mode if "r" in r_mode:
+                return_fd = rfd
+                relay_fd = wfd
             case _:
                 raise ValueError(f"未知的模式 {mode}")
         dup2(relay_fd, target_fd, inheritable=True)
@@ -146,18 +135,28 @@ class ServerBase(ABC):
         with ini_path.open(mode="wt", encoding="utf-8") as ini_file:
             ini_parser.write(ini_file)
 
-    def load_ini(self, ini_path: Optional[Path] = None) -> None:
-        """加载 ini 配置文件"""
-        ini_path = ini_path or self.config_path
-        self.logger.info(f"加载配置文件 {ini_path}")
-        config_dict = self._load_ini(ini_path)
-        self.config.parse_obj(config_dict)
+    def load_config(self, config_path: Optional[Path] = None) -> None:
+        """加载配置"""
+        config_path = config_path or self.config_path
+        config_mode_class = type(self.config)
 
-    def save_ini(self, ini_path: Optional[Path] = None) -> None:
+        if config_path.exists():
+            self.logger.info(f"加载配置文件 {config_path}")
+            config_dict = self._load_ini(config_path)
+            config = config_mode_class.parse_obj(config_dict)
+        else:
+            self.logger.warning(f"配置文件 {config_path} 不存在，生成并加载默认配置文件")
+            config = config_mode_class()
+            self.save_config(config, config_path)
+
+        self.config = config
+
+    def save_config(
+        self, config: Optional[BaseModel] = None, config_path: Optional[Path] = None
+    ) -> None:
         """保存 ini 配置文件"""
-        ini_path = ini_path or self.config_path
-        self.logger.info(f"保存配置文件 {ini_path}")
-        config_dict = self.config.dict()
-        self._save_ini(config_dict, ini_path)
+        config = config or self.config
+        config_path = config_path or self.config_path
 
-if __name__ =="__main__":
+        self.logger.info(f"保存配置文件 {config_path}")
+        self._save_ini(config.dict(), config_path)

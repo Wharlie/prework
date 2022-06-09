@@ -1,14 +1,14 @@
-from dataclasses import dataclass
+from subprocess import CalledProcessError, run
+from dataclasses import dataclass, field
 from enum import Enum
 from ipaddress import IPv4Address
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Thread
 from typing import ClassVar, Iterable
 
 from pydantic import BaseModel
 
-from ._server_base import Arch, ServerBase
+from ._server_base import ServerBase
 from .shard import Shard
 
 
@@ -106,71 +106,63 @@ class ClusterGameplayModel(BaseModel):
 class ClusterIniModel(BaseModel):
     """集群配置模型（cluster.ini）"""
 
-    misc: ClusterMiscModel
-    shard: ClusterShardModel
-    steam: ClusterSteamModel
-    network: ClusterNetworkModel
-    gameplay: ClusterGameplayModel
+    misc: ClusterMiscModel = ClusterMiscModel()
+    shard: ClusterShardModel = ClusterShardModel(
+        master_ip=IPv4Address("127.0.0.1"),
+        cluster_key="dont_starve_together",
+    )
+    steam: ClusterSteamModel = ClusterSteamModel()
+    network: ClusterNetworkModel = ClusterNetworkModel(
+        cluster_password="",
+        cluster_name="DST",
+        cluster_description="Don't Starve Together",
+        cluster_intention=ClusterIntention.COOPERATIVE,
+    )
+    gameplay: ClusterGameplayModel = ClusterGameplayModel()
 
 
+@dataclass
 class Cluster(ServerBase):
     """集群"""
 
-    shard_list: list[Shard]
-
-    arch: Arch = Arch.amd64
     steamcmd_path: ClassVar[Path] = Path("/home/steam/steamcmd/steamcmd.sh")
     dst_install_path: ClassVar[Path] = Path("/home/steam/DST")
-
-    data_root_path: Path = Path("/home/steam/data")
-    conf_dir_name: str = "dst"
+    dst_bin_path: ClassVar[Path] = Path(
+        "/home/steam/DST/bin64/dontstarve_dedicated_server_nullrenderer_x64"
+    )
     config_file_name: ClassVar[str] = "cluster.ini"
-    mods_dir_name: ClassVar[str] = "mods"
-    ugc_dir_name: ClassVar[str] = "ugc"
+    ugc_dir_name: ClassVar[str] = "ugc_mods"
     permission_config_file_names: ClassVar[Iterable[str]] = (
         "adminlist.txt",
         "whitelist.txt",
         "blocklist.txt",
     )
 
-    @property
-    def conf_dir_path(self) -> Path:
-        return self.data_root_path / self.conf_dir_name
+    shard_list: list[Shard] = field(default_factory=list)
+
+    config: ClusterIniModel = field(default_factory=ClusterIniModel, init=False)
 
     @property
-    def mods_path(self) -> Path:
-        return self.dir_path / self.mods_dir_name
+    def data_root_path(self) -> Path:
+        return self.dir_path.parents[1]
+
+    @property
+    def conf_dir_path(self) -> Path:
+        return self.dir_path.parent
 
     @property
     def ugc_path(self) -> Path:
-        return self.mods_path / self.ugc_dir_name
-
-    @property
-    def dst_bin_path(self) -> Path:
-        match self.arch:
-            case Arch.amd64:
-                return (
-                    self.dst_install_path
-                    / "bin64"
-                    / "dontstarve_dedicated_server_nullrenderer_x64"
-                )
-            case Arch.x86:
-                return (
-                    self.dst_install_path
-                    / "bin"
-                    / "dontstarve_dedicated_server_nullrenderer"
-                )
-            case _:
-                err_msg = f"未知架构 {self.arch}"
-                self.logger.error(err_msg)
-                raise ValueError(err_msg)
+        return self.dst_install_path / self.ugc_dir_name
 
     @classmethod
     def update_mods(cls) -> None:
         """更新 mod"""
         with TemporaryDirectory() as temp_dir:
             temp_dir_path = Path(temp_dir)
-            
+            temp_cluster = Cluster(dir_path=temp_dir_path)
+            temp_shard = Shard(dir_path=temp_dir_path / "Temp", cluster=temp_cluster)
+            temp_cluster.shard_list.append(temp_shard)
+            temp_shard.update_mods()
 
     @classmethod
     def update_steam(cls) -> None:
@@ -182,6 +174,11 @@ class Cluster(ServerBase):
         cmd_list += ("+login", "anonymous")
         cmd_list += ("+app_update", "343049", "validate")
         cmd_list += ("+quit",)
+        try:
+            run(cmd_list,check=True)
+        except CalledProcessError as e:
+            raise RuntimeError("Steam 更新失败") from e
+        
 
     def _detect_shard_paths(self) -> list[Path]:
         """检测分片文件夹路径"""
@@ -197,34 +194,37 @@ class Cluster(ServerBase):
             file_path = self.dir_path / file_name
             file_path.touch()
 
-        self.mods_path.mkdir(exist_ok=True)
-        self.ugc_path.mkdir(exist_ok=True)
-    
-    def _monitor_stats(self) -> None:
-        """监控 shard 的 fd5 中的统计信息"""
-
-        
-        for shard in self.shard_list:
-            pass
-            
-        
+    def is_running(self) -> bool:
+        """是否在运行中"""
+        return any(shard.is_running() for shard in self.shard_list)
 
     def update(self) -> None:
         """更新"""
+        self.logger.info("更新 steam")
         self.update_steam()
+        self.logger.info("更新 mod")
         self.update_mods()
-
-    def _start(self) -> None:
-        pass
-
-    def _stop(self) -> None:
-        pass
 
     def start(self) -> None:
         """启动"""
-        self.load_ini()
-        self.update()
-        self._start()
+        if not self.is_running():
+            self.load_config()
+            self.update()
+
+            if not self.shard_list:
+                for shard_path in self._detect_shard_paths():
+                    shard = Shard(dir_path=shard_path, cluster=self)
+                    self.shard_list.append(shard)
+
+            for shard in self.shard_list:
+                shard.start()
+        else:
+            self.logger.warning(f"集群 {self.name} 已在运行态，忽略启动操作")
 
     def stop(self) -> None:
-        self._stop()
+        """停止"""
+        if self.is_running():
+            for shard in self.shard_list:
+                shard.stop()
+        else:
+            self.logger.warning(f"集群 {self.name} 不在运行态，忽略停止操作")

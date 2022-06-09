@@ -4,6 +4,7 @@ from os import getpid
 from pathlib import Path
 from random import randrange
 from subprocess import PIPE, STDOUT, Popen, TimeoutExpired
+from threading import Thread
 from typing import ClassVar, Iterable, Optional, TextIO, cast
 
 from pydantic import BaseModel, Field
@@ -46,10 +47,12 @@ class ServerAccountModel(BaseModel):
 class ServerIniModel(BaseModel):
     """服务端配置模型（server.ini）"""
 
-    shard: ServerShardModel
-    steam: ServerSteamModel
-    network: ServerNetworkModel
-    account: ServerAccountModel
+    # 模型中默认值均来自官方文档
+    # 此处提供的默认值则是开发者自行补充和调整后的默认值
+    shard: ServerShardModel = ServerShardModel(is_master=True, name="[SHDMASTER]")
+    steam: ServerSteamModel = ServerSteamModel()
+    network: ServerNetworkModel = ServerNetworkModel()
+    account: ServerAccountModel = ServerAccountModel(encode_user_path=True)
 
 
 @dataclass
@@ -59,12 +62,14 @@ class Shard(ServerBase):
     config_file_name: ClassVar[str] = "server.ini"
 
     cluster: Cluster
-    config: ServerIniModel
+    stats: dict = field(default_factory=dict)
+    config: ServerIniModel = field(default_factory=ServerIniModel, init=False)
 
     _fd3_file: Optional[TextIO] = field(default=None, init=False)
     _fd4_file: Optional[TextIO] = field(default=None, init=False)
     _fd5_file: Optional[TextIO] = field(default=None, init=False)
     _process: Optional[Popen] = field(default=None, init=False)
+    _monitor_thread: Optional[Thread] = field(default=None, init=False)
 
     def _remove_server_temp(self) -> None:
         """删除服务端临时文件"""
@@ -85,18 +90,18 @@ class Shard(ServerBase):
             TextIO, self._open_inheritable_pipe(5, "rt")
         )
 
-    def _start(
+    def _start_server(
         self,
         skip_update_server_mods: bool = True,
         remove_server_temp: bool = True,
         extra_args: Optional[Iterable[str]] = None,
     ) -> None:
-        """底层启动方法"""
+        """启动服务端"""
 
         cmd_list = [str(self.cluster.dst_bin_path)]
         cmd_list += ("-cloudserver",)
         cmd_list += ("persistent_storage_root", str(self.cluster.data_root_path))
-        cmd_list += ("-conf_dir", str(self.cluster.conf_dir_path))
+        cmd_list += ("-conf_dir", self.cluster.conf_dir_path.name)
         cmd_list += ("-cluster", self.cluster.name)
         cmd_list += ("-shard", self.name)
         cmd_list += ("-ugc_directory", str(self.cluster.ugc_path))
@@ -113,7 +118,6 @@ class Shard(ServerBase):
         if remove_server_temp:
             self._remove_server_temp()
 
-        self._open_fd_files()
         self._process = Popen(
             cmd_list,
             stdin=PIPE,
@@ -124,46 +128,79 @@ class Shard(ServerBase):
             encoding="utf-8",
         )
 
-    def _read_stats(self) -> None:
-        """从 fd5 读取统计数据"""
-        stats_output = cast(TextIO, self._fd5_file)
-        stats_raw = stats_output.readline().strip()
-        stats_key, stats_value = stats_raw.split("|")
-        match stats_key.lower():
-            # DST_Stats|3.226599,2.355073,0.293711,3,8
-            case "dst_stats":
-                stats_value.split(",")
-            case "dst_sessionid":
-                pass
-            case "dst_master_ready":
-                pass
-            case "dst_numplayerschanged":
-                num_players = int(stats_value)
-            case "dst_saved":
-                data_file = Path(stats_value)
-            
+    def _update_stats(self) -> None:
+        """从 fd5 读取并更新统计数据"""
+        self.logger.debug(f"分片 {self.name} 统计数据更新循环启动")
+        while self.is_running():
+            stats_output = cast(TextIO, self._fd5_file)
+            stats_raw = stats_output.readline().strip()
+            if stats_raw:
+                stats_key, stats_value = stats_raw.split("|")
+                match stats_key.lower():
+                    case "dst_stats":
+                        # DST_Stats|3.226599,2.355073,0.293711,3,8
+                        (
+                            cpu_load1,
+                            cpu_load2,
+                            unknown,
+                            num_players,
+                            max_players,
+                        ) = stats_value.split(",")
+                    case "dst_sessionid":
+                        # DST_SessionId|804FE0E9FFCE345E
+                        self.stats["session_id"] = stats_value
+                    case "dst_master_ready":
+                        # DST_Master_Ready|10999
+                        self.stats["port"] = int(stats_value)
+                    case "dst_numplayerschanged":
+                        # DST_NumPlayersChanged|2
+                        self.stats["num_players"] = int(stats_value)
+                    case "dst_saved":
+                        # DST_Saved|session/8B1254AC45168660/0000000033
+                        self.stats["data_file"] = Path(stats_value)
+                    case _:
+                        self.logger.warning(f"未知统计数据 {stats_raw}")
+        else:
+            self.logger.debug(f"分片 {self.name} 统计数据更新循环终止")
+            return
 
-        
+    def _monitor_stats(self) -> None:
+        """监控统计数据"""
+        self.logger.info(f"启动分片 {self.name} 统计数据监控线程")
+        self._monitor_thread = Thread(target=self._update_stats)
+        self._monitor_thread.start()
+
+    def is_running(self) -> bool:
+        """是否在运行中"""
+        if self._process and not self._process.returncode:
+            return True
+        else:
+            return False
 
     def start(self) -> None:
         """启动分片"""
-        self.logger.info(f"启动分片 {self.name}")
-        self._start()
+        if not self.is_running():
+            self.logger.info(f"启动分片 {self.name}")
+            self.load_config()
+            self._open_fd_files()
+            self._start_server()
+            self._monitor_stats()
+        else:
+            self.logger.warning(f"分片 {self.name} 已在运行态，忽略启动操作")
 
     def stop(self, save: bool = True) -> None:
         """停止分片"""
-        self._stop_by_cmd(save=save)
+        if self.is_running():
+            self.logger.info(f"停止分片 {self.name}")
+            self._stop_by_cmd(save=save)
+            cast(Thread, self._monitor_thread).join()
+        else:
+            self.logger.warning(f"分片 {self.name} 不在运行态，忽略停止操作")
 
-    def restart(self) -> None:
-        """重启"""
-        self.logger.info(f"重启分片 {self.name}")
-        self.stop()
-        self._start(remove_server_temp=False)
-
-    def update_mod(self) -> None:
+    def update_mods(self) -> None:
         """更新 mod"""
         self.logger.info("更新 mod")
-        self._start(
+        self._start_server(
             skip_update_server_mods=False,
             extra_args=("-only_update_server_mods",),
         )
@@ -214,9 +251,8 @@ class Shard(ServerBase):
 
     def _save(self) -> None:
         """存档"""
-        self._timeout_cmd(f"c_save())", timeout=30.0)
+        self._timeout_cmd(f"c_save()", timeout=30.0)
 
     def _announce(self, msg: str) -> None:
         """公告"""
-        self._timeout_cmd(f"c_announce({msg})", timeout=5.0)
-
+        self._timeout_cmd(f"c_announce(\"{msg}\")", timeout=5.0)
